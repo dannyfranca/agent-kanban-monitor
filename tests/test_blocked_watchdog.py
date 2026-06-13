@@ -311,6 +311,59 @@ def test_shared_state_preserves_other_board_entries(tmp_path):
     assert "ops:t_new" in state
 
 
+def test_shared_state_preserves_same_board_entries_from_other_filter_scopes(tmp_path):
+    state_path = tmp_path / "shared-state.json"
+    alice_dir = tmp_path / "alice"
+    bob_dir = tmp_path / "bob"
+    alice_dir.mkdir()
+    bob_dir.mkdir()
+    alice_config = write_config(alice_dir, assignee="alice", state_path=str(state_path))
+    bob_config = write_config(bob_dir, assignee="bob", state_path=str(state_path))
+
+    first_alice = run_once(alice_config, runner=fake_runner([{"id": "t_alice", "title": "Alice task"}]), now=10)
+    first_bob = run_once(bob_config, runner=fake_runner([{"id": "t_bob", "title": "Bob task"}]), now=20)
+    second_alice = run_once(alice_config, runner=fake_runner([{"id": "t_alice", "title": "Alice task"}]), now=30)
+
+    assert "t_alice" in first_alice
+    assert "t_bob" in first_bob
+    assert second_alice == ""
+    assert read_state(alice_config)["notified"] == {
+        "default|assignee=alice:t_alice": {
+            "task_id": "t_alice",
+            "board": "default",
+            "scope": "default|assignee=alice",
+            "notified_at": 10,
+            "last_seen_blocked_at": 30,
+        },
+        "default|assignee=bob:t_bob": {
+            "task_id": "t_bob",
+            "board": "default",
+            "scope": "default|assignee=bob",
+            "notified_at": 20,
+            "last_seen_blocked_at": 20,
+        },
+    }
+
+
+def test_shared_state_preserves_same_board_entries_from_other_status_scopes(tmp_path):
+    state_path = tmp_path / "shared-state.json"
+    blocked_dir = tmp_path / "blocked"
+    review_dir = tmp_path / "review"
+    blocked_dir.mkdir()
+    review_dir.mkdir()
+    blocked_config = write_config(blocked_dir, status="blocked", state_path=str(state_path))
+    review_config = write_config(review_dir, status="review", state_path=str(state_path))
+
+    first_blocked = run_once(blocked_config, runner=fake_runner([{"id": "t_blocked", "title": "Blocked task"}]), now=10)
+    first_review = run_once(review_config, runner=fake_runner([{"id": "t_review", "title": "Review task"}]), now=20)
+    second_blocked = run_once(blocked_config, runner=fake_runner([{"id": "t_blocked", "title": "Blocked task"}]), now=30)
+
+    assert "t_blocked" in first_blocked
+    assert "t_review" in first_review
+    assert second_blocked == ""
+    assert set(read_state(blocked_config)["notified"]) == {"default:t_blocked", "default|status=review:t_review"}
+
+
 def test_dashboard_url_template_substitution_and_title_truncation(tmp_path):
     config_path = write_config(
         tmp_path,

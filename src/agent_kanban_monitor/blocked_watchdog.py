@@ -120,6 +120,17 @@ class WatchdogConfig:
     def board_key(self) -> str:
         return self.board or "default"
 
+    @property
+    def state_scope_key(self) -> str:
+        parts = [self.board_key]
+        if self.status != "blocked":
+            parts.append(f"status={self.status}")
+        if self.assignee:
+            parts.append(f"assignee={self.assignee}")
+        if self.tenant:
+            parts.append(f"tenant={self.tenant}")
+        return "|".join(parts)
+
 
 def default_runner(args: list[str], env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     subprocess_env = os.environ.copy()
@@ -226,7 +237,8 @@ def update_state(
     *,
     now: int,
 ) -> tuple[dict[str, Any], list[Mapping[str, Any]]]:
-    current_by_key = {state_key(config.board_key, str(task["id"])): task for task in current_tasks}
+    current_scope = config.state_scope_key
+    current_by_key = {state_key(current_scope, str(task["id"])): task for task in current_tasks}
     notified = state.get("notified", {})
     ttl_seconds = config.max_state_age_days * 24 * 60 * 60
 
@@ -236,24 +248,28 @@ def update_state(
     for key, existing in notified.items():
         if not isinstance(existing, dict):
             continue
-        if entry_board(key, existing) != config.board_key and not entry_is_stale(existing, now, ttl_seconds):
+        if entry_scope(key, existing) != current_scope and not entry_is_stale(existing, now, ttl_seconds):
             next_notified[key] = dict(existing)
 
     for key, task in current_by_key.items():
         existing = notified.get(key)
         if not isinstance(existing, dict):
             newly_blocked.append(task)
-            next_notified[key] = new_state_entry(config.board_key, str(task["id"]), now, now)
+            next_notified[key] = new_state_entry(config.board_key, current_scope, str(task["id"]), now, now)
             continue
 
         if entry_is_stale(existing, now, ttl_seconds):
             newly_blocked.append(task)
-            next_notified[key] = new_state_entry(config.board_key, str(task["id"]), now, now)
+            next_notified[key] = new_state_entry(config.board_key, current_scope, str(task["id"]), now, now)
             continue
 
         entry = dict(existing)
         entry["task_id"] = str(task["id"])
         entry["board"] = config.board_key
+        if current_scope != config.board_key:
+            entry["scope"] = current_scope
+        else:
+            entry.pop("scope", None)
         entry["last_seen_blocked_at"] = now
         next_notified[key] = entry
 
@@ -264,7 +280,14 @@ def entry_board(key: str, entry: Mapping[str, Any]) -> str:
     board = entry.get("board")
     if isinstance(board, str) and board:
         return board
-    return key.split(":", 1)[0]
+    return entry_scope(key, entry).split("|", 1)[0]
+
+
+def entry_scope(key: str, entry: Mapping[str, Any]) -> str:
+    scope = entry.get("scope")
+    if isinstance(scope, str) and scope:
+        return scope
+    return key.rsplit(":", 1)[0]
 
 
 def entry_is_stale(entry: Mapping[str, Any], now: int, ttl_seconds: int) -> bool:
@@ -272,17 +295,20 @@ def entry_is_stale(entry: Mapping[str, Any], now: int, ttl_seconds: int) -> bool
     return now - last_seen > ttl_seconds
 
 
-def state_key(board: str, task_id: str) -> str:
-    return f"{board}:{task_id}"
+def state_key(scope: str, task_id: str) -> str:
+    return f"{scope}:{task_id}"
 
 
-def new_state_entry(board: str, task_id: str, notified_at: int, last_seen_blocked_at: int) -> dict[str, Any]:
-    return {
+def new_state_entry(board: str, scope: str, task_id: str, notified_at: int, last_seen_blocked_at: int) -> dict[str, Any]:
+    entry = {
         "task_id": task_id,
         "board": board,
         "notified_at": notified_at,
         "last_seen_blocked_at": last_seen_blocked_at,
     }
+    if scope != board:
+        entry["scope"] = scope
+    return entry
 
 
 def save_state_atomic(path: Path, state: Mapping[str, Any]) -> None:
