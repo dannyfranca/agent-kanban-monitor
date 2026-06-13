@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Generic Hermes Kanban blocked-task watchdog"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = { text = "MIT" }
 authors = [{ name = "Danny Franca" }]
 
 [project.scripts]
