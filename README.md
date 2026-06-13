@@ -75,6 +75,7 @@ Example:
 Notes:
 - `dashboard_url_template` must include `{task_id}`. It may also include `{board}`.
 - For phone/mobile use, set a reachable URL, e.g. Tailnet: `http://agent:9119/kanban?task={task_id}`.
+- If multiple Hermes profiles monitor boards with the same name, give each profile its own `state_path` to keep notification history isolated.
 - Do not put polling frequency in this config. Frequency belongs to the scheduler: Hermes cron `every 5m` / `every 10m`, or systemd `OnUnitActiveSec=5min`.
 
 ## Run once
