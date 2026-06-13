@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-kanban-monitor"
+version = "0.1.0"
+description = "Generic Hermes Kanban blocked-task watchdog"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Danny Franca" }]
+
+[project.scripts]
+kanban-blocked-watchdog = "agent_kanban_monitor.blocked_watchdog:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
