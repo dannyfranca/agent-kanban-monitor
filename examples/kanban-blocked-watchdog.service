@@ -1,0 +1,8 @@
+[Unit]
+Description=Hermes Kanban blocked-task watchdog
+Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/path/to/agent-kanban-monitor
+ExecStart=%h/path/to/agent-kanban-monitor/.venv/bin/kanban-blocked-watchdog --config %h/.config/agent-kanban-monitor/blocked-watchdog.json

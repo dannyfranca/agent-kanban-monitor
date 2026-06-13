@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Hermes Kanban blocked-task watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=kanban-blocked-watchdog.service
+
+[Install]
+WantedBy=timers.target
