@@ -418,22 +418,20 @@ def save_state_atomic(path: Path, state: Mapping[str, Any]) -> None:
 
 
 def render_message(config: WatchdogConfig, tasks: Sequence[Mapping[str, Any]]) -> str:
-    lines = ["🚧 **Kanban needs attention**", ""]
+    lines: list[str] = []
     for index, task in enumerate(tasks):
         if index:
             lines.append("")
         task_id = str(task["id"])
         title = truncate(str(task.get("title") or "(untitled task)"), config.title_max_chars)
-        lines.append(f"⏸ `{task_id}` — {title}")
-        if config.include_reason:
-            reason = extract_reason(task)
-            if reason:
-                lines.append(f"↳ {truncate(reason, config.title_max_chars)}")
+        reason = extract_reason(task) if config.include_reason else None
+        headline = truncate(reason or title, config.title_max_chars)
+        lines.append(f"🟢 **Kanban ready — {headline}**")
+        lines.append(f"`{task_id}`")
         lines.append(format_dashboard_link(config, task_id))
         pr_url = extract_pr_url(task) if config.include_pr_link else None
         if pr_url:
             lines.append(format_pr_link(config, pr_url))
-    lines.extend(["", "Tip: unblock or comment from the Kanban dashboard when ready."])
     return "\n".join(lines) + "\n"
 
 
