@@ -8,5 +8,7 @@
   "dashboard_url_template": "http://YOUR-HERMES-HOST:9119/kanban?task={task_id}",
   "title_max_chars": 120,
   "include_reason": true,
+  "include_pr_link": true,
+  "pr_link_label": "Open GitHub PR",
   "max_state_age_days": 30
 }
