@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import os
+import re
 import string
 import subprocess
 import sys
@@ -10,11 +12,15 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
 
 Runner = Callable[[list[str], Mapping[str, str] | None], subprocess.CompletedProcess[str]]
+
+GITHUB_PR_URL_RE = re.compile(r"https?://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)")
+GITHUB_PR_SHORTHAND_RE = re.compile(r"github:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)")
 
 
 class WatchdogError(Exception):
@@ -44,6 +50,8 @@ class WatchdogConfig:
     dashboard_url_template: str = "http://localhost:9119/kanban?task={task_id}"
     title_max_chars: int = 120
     include_reason: bool = True
+    include_pr_link: bool = True
+    pr_link_label: str = "Open GitHub PR"
     max_state_age_days: int = 30
 
     @classmethod
@@ -86,6 +94,14 @@ class WatchdogConfig:
         if not isinstance(include_reason, bool):
             raise ConfigError("config field 'include_reason' must be a boolean")
 
+        include_pr_link = data.get("include_pr_link", cls.include_pr_link)
+        if not isinstance(include_pr_link, bool):
+            raise ConfigError("config field 'include_pr_link' must be a boolean")
+
+        pr_link_label = data.get("pr_link_label", cls.pr_link_label)
+        if not isinstance(pr_link_label, str) or not pr_link_label.strip():
+            raise ConfigError("config field 'pr_link_label' must be a non-empty string")
+
         state_path_raw = data.get("state_path", str(cls.state_path))
         if not isinstance(state_path_raw, str) or not state_path_raw.strip():
             raise ConfigError("config field 'state_path' must be a non-empty string")
@@ -113,6 +129,8 @@ class WatchdogConfig:
             dashboard_url_template=dashboard_url_template,
             title_max_chars=title_max_chars,
             include_reason=include_reason,
+            include_pr_link=include_pr_link,
+            pr_link_label=pr_link_label.strip(),
             max_state_age_days=max_state_age_days,
         )
 
@@ -145,14 +163,18 @@ def run_once(config_path: str | Path, *, runner: Runner | None = None, now: int 
         return ""
 
     current_time = int(time.time() if now is None else now)
-    tasks = fetch_blocked_tasks(config, runner=runner or default_runner)
+    command_runner = runner or default_runner
+    tasks = fetch_blocked_tasks(config, runner=command_runner)
     state = load_state(config.state_path)
     new_state, newly_blocked = update_state(config, state, tasks, now=current_time)
-    save_state_atomic(config.state_path, new_state)
 
     if not newly_blocked:
+        save_state_atomic(config.state_path, new_state)
         return ""
-    return render_message(config, newly_blocked)
+    newly_blocked = enrich_newly_blocked_tasks(config, newly_blocked, runner=command_runner)
+    message = render_message(config, newly_blocked)
+    save_state_atomic(config.state_path, new_state)
+    return message
 
 
 def fetch_blocked_tasks(config: WatchdogConfig, *, runner: Runner) -> list[dict[str, Any]]:
@@ -182,6 +204,70 @@ def fetch_blocked_tasks(config: WatchdogConfig, *, runner: Runner) -> list[dict[
         raise KanbanCommandError(f"invalid Kanban JSON: {exc}") from exc
 
     return extract_tasks(payload)
+
+
+def enrich_newly_blocked_tasks(
+    config: WatchdogConfig,
+    tasks: Sequence[Mapping[str, Any]],
+    *,
+    runner: Runner,
+) -> list[Mapping[str, Any]]:
+    if not config.include_reason and not config.include_pr_link:
+        return list(tasks)
+    enriched: list[Mapping[str, Any]] = []
+    for task in tasks:
+        if not task_needs_detail_enrichment(config, task):
+            enriched.append(task)
+        else:
+            enriched.append(fetch_task_detail(config, str(task["id"]), runner=runner, fallback=task))
+    return enriched
+
+
+def task_needs_detail_enrichment(config: WatchdogConfig, task: Mapping[str, Any]) -> bool:
+    needs_reason = config.include_reason and not extract_reason(task)
+    needs_pr_link = config.include_pr_link
+    return needs_reason or needs_pr_link
+
+
+def fetch_task_detail(
+    config: WatchdogConfig,
+    task_id: str,
+    *,
+    runner: Runner,
+    fallback: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    args = ["hermes", "kanban", "--board", config.board_key, "show", task_id, "--json"]
+    command_env: dict[str, str] = {}
+    if config.board:
+        command_env["HERMES_KANBAN_BOARD"] = config.board
+        command_env["HERMES_KANBAN_DB"] = ""
+
+    try:
+        completed = runner(args, command_env or None)
+    except OSError:
+        return fallback
+
+    if completed.returncode != 0:
+        return fallback
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return fallback
+
+    if not isinstance(payload, dict):
+        return fallback
+
+    enriched = dict(fallback)
+    payload_task = payload.get("task")
+    if isinstance(payload_task, dict):
+        enriched.update(payload_task)
+    for key in ("latest_summary",):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            enriched[key] = value.strip()
+    enriched["_kanban_detail"] = payload
+    return enriched
 
 
 def extract_tasks(payload: Any) -> list[dict[str, Any]]:
@@ -343,7 +429,10 @@ def render_message(config: WatchdogConfig, tasks: Sequence[Mapping[str, Any]]) -
             reason = extract_reason(task)
             if reason:
                 lines.append(f"↳ {truncate(reason, config.title_max_chars)}")
-        lines.append(f"🔗 {format_dashboard_url(config, task_id)}")
+        lines.append(format_dashboard_link(config, task_id))
+        pr_url = extract_pr_url(task) if config.include_pr_link else None
+        if pr_url:
+            lines.append(format_pr_link(config, pr_url))
     lines.extend(["", "Tip: unblock or comment from the Kanban dashboard when ready."])
     return "\n".join(lines) + "\n"
 
@@ -358,11 +447,154 @@ def truncate(value: str, max_chars: int) -> str:
 
 
 def extract_reason(task: Mapping[str, Any]) -> str | None:
-    for key in ("blocked_reason", "block_reason", "reason", "result"):
+    for key in ("blocked_reason", "block_reason", "reason", "result", "latest_summary"):
         value = task.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def extract_pr_url(task: Mapping[str, Any]) -> str | None:
+    for value in pr_search_values(task):
+        if not isinstance(value, str):
+            continue
+        match = GITHUB_PR_URL_RE.search(value)
+        if match:
+            return normalize_github_pr_url(*match.groups())
+        match = GITHUB_PR_SHORTHAND_RE.search(value)
+        if match:
+            return normalize_github_pr_url(*match.groups())
+    return None
+
+
+def pr_search_values(task: Mapping[str, Any]) -> Iterable[Any]:
+    detail = task.get("_kanban_detail")
+    if isinstance(detail, Mapping):
+        contexts: list[tuple[tuple[int, int], Iterable[Any]]] = []
+        comments = detail.get("comments")
+        if isinstance(comments, list):
+            for index, comment in newest_mappings(comments):
+                contexts.append((sort_timestamp(comment, index), [comment.get("body")]))
+
+        latest_summary = detail.get("latest_summary")
+        latest_summary_run_key: tuple[int, int] | None = None
+        runs = detail.get("runs")
+        if isinstance(runs, list):
+            for index, run in newest_mappings(runs):
+                run_key = sort_timestamp(run, index)
+                if isinstance(latest_summary, str) and run_contains_text(run, latest_summary):
+                    latest_summary_run_key = max(latest_summary_run_key or run_key, run_key)
+                contexts.append((run_key, walk_run_pr_values(run)))
+
+        if isinstance(latest_summary, str) and latest_summary.strip():
+            contexts.append((latest_summary_run_key or (0, 0), [latest_summary]))
+
+        for _, values in sorted(contexts, key=lambda item: item[0], reverse=True):
+            yield from values
+
+        for key in ("summary", "result"):
+            yield detail.get(key)
+
+    for key in ("blocked_reason", "block_reason", "latest_summary", "reason", "result", "body", "title"):
+        yield task.get(key)
+
+
+def newest_mappings(values: Sequence[Any], *, limit: int = 50) -> list[tuple[int, Mapping[str, Any]]]:
+    candidates = [(index, value) for index, value in enumerate(values) if isinstance(value, Mapping)]
+    return heapq.nlargest(limit, candidates, key=lambda item: sort_timestamp(item[1], item[0]))
+
+
+def sort_timestamp(value: Mapping[str, Any], index: int) -> tuple[int, int]:
+    primary = value.get("ended_at") or value.get("created_at") or value.get("started_at") or 0
+    secondary = value.get("id") or index
+    return (parse_timestamp(primary), parse_timestamp(secondary))
+
+
+def run_contains_text(run: Mapping[str, Any], text: str) -> bool:
+    return any(run.get(key) == text for key in ("summary", "result", "body"))
+
+
+def parse_timestamp(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        try:
+            parsed = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp())
+        except ValueError:
+            return 0
+    return 0
+
+
+def walk_run_pr_values(run: Mapping[str, Any]) -> Iterable[str]:
+    for key in ("summary", "result", "body"):
+        if key in run:
+            yield from walk_pr_values(run[key])
+    if "metadata" in run:
+        yield from walk_metadata_pr_values(run["metadata"])
+    if "error" in run:
+        yield from walk_pr_values(run["error"])
+
+
+def walk_metadata_pr_values(value: Any, *, depth: int = 0) -> Iterable[str]:
+    if depth > 6:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        priority_keys = (
+            "pr_url",
+            "pr_link",
+            "github_pr_url",
+            "github_pr",
+            "pull_request_url",
+            "pull_request",
+            "pr",
+            "handoff",
+            "review",
+            "review_required",
+        )
+        seen: set[str] = set()
+        for key in priority_keys:
+            if key in value:
+                seen.add(key)
+                yield from walk_metadata_pr_values(value[key], depth=depth + 1)
+        for index, (key, nested) in enumerate(value.items()):
+            if index >= 50:
+                break
+            if key not in seen:
+                yield from walk_metadata_pr_values(nested, depth=depth + 1)
+    elif isinstance(value, list):
+        for item in value[:20]:
+            yield from walk_metadata_pr_values(item, depth=depth + 1)
+
+
+def walk_pr_values(value: Any, *, depth: int = 0) -> Iterable[str]:
+    if depth > 6:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for index, nested in enumerate(value.values()):
+            if index >= 50:
+                break
+            yield from walk_pr_values(nested, depth=depth + 1)
+    elif isinstance(value, list):
+        for item in value[:20]:
+            yield from walk_pr_values(item, depth=depth + 1)
+
+
+def normalize_github_pr_url(owner: str, repo: str, number: str) -> str:
+    return f"https://github.com/{owner}/{repo}/pull/{number}"
 
 
 def format_dashboard_url(config: WatchdogConfig, task_id: str) -> str:
@@ -370,6 +602,17 @@ def format_dashboard_url(config: WatchdogConfig, task_id: str) -> str:
         return config.dashboard_url_template.format(task_id=task_id, board=config.board_key)
     except (KeyError, ValueError) as exc:
         raise ConfigError(f"invalid dashboard_url_template: {exc}") from exc
+
+
+def format_dashboard_link(config: WatchdogConfig, task_id: str) -> str:
+    target = format_dashboard_url(config, task_id)
+    if target.startswith("[") and "](" in target and target.endswith(")"):
+        return target
+    return f"[Open Kanban task]({target})"
+
+
+def format_pr_link(config: WatchdogConfig, url: str) -> str:
+    return f"[{config.pr_link_label}]({url})"
 
 
 def validate_dashboard_url_template(template: str) -> None:

@@ -19,6 +19,8 @@ def write_config(tmp_path: Path, **overrides) -> Path:
         "dashboard_url_template": "http://agent:9119/kanban?task={task_id}",
         "title_max_chars": 120,
         "include_reason": True,
+        "include_pr_link": True,
+        "pr_link_label": "Open GitHub PR",
         "max_state_age_days": 30,
     }
     config.update(overrides)
@@ -43,6 +45,10 @@ def fake_runner(tasks):
     return FakeRunner(tasks)
 
 
+def completed_json(args, payload):
+    return subprocess.CompletedProcess(args=args, returncode=0, stdout=json.dumps(payload), stderr="")
+
+
 def read_state(config_path: Path) -> dict:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     return json.loads(Path(config["state_path"]).read_text(encoding="utf-8"))
@@ -58,9 +64,9 @@ def test_first_blocked_task_emits_message_and_records_state(tmp_path):
 
     assert "🚧 **Kanban needs attention**" in message
     assert "⏸ `t_aa4b9231` — Implement WhatsApp cart total in holder-name prompt" in message
-    assert "needs product decision" in message
-    assert "🔗 http://agent:9119/kanban?task=t_aa4b9231" in message
-    assert runner.last_args == ["hermes", "kanban", "--board", "default", "list", "--status", "blocked", "--json"]
+    assert "↳ needs product decision" in message
+    assert "[Open Kanban task](http://agent:9119/kanban?task=t_aa4b9231)" in message
+    assert runner.last_args == ["hermes", "kanban", "--board", "default", "show", "t_aa4b9231", "--json"]
     assert runner.last_env["HERMES_KANBAN_BOARD"] == "default"
     assert read_state(config_path) == {
         "version": 1,
@@ -73,6 +79,370 @@ def test_first_blocked_task_emits_message_and_records_state(tmp_path):
             }
         },
     }
+
+
+def test_new_blocked_task_uses_latest_summary_from_show_when_list_has_no_reason(tmp_path):
+    config_path = write_config(tmp_path)
+    calls = []
+
+    def runner(args, env=None):
+        calls.append(args)
+        if "list" in args:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=json.dumps([{"id": "t_reason", "title": "Verbose task title"}]),
+                stderr="",
+            )
+        if "show" in args:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "task": {"id": "t_reason", "title": "Verbose task title"},
+                        "latest_summary": "permission-required: grant workflow scope",
+                    }
+                ),
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "↳ permission-required: grant workflow scope" in message
+    assert calls[0] == ["hermes", "kanban", "--board", "default", "list", "--status", "blocked", "--json"]
+    assert calls[1] == ["hermes", "kanban", "--board", "default", "show", "t_reason", "--json"]
+
+
+def test_raw_github_pr_url_from_handoff_comment_renders_pr_link(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_review", "title": "Review required", "result": "review-required: PR opened"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_review", "title": "Review required", "result": "review-required: PR opened"},
+                    "comments": [
+                        {
+                            "author": "coder",
+                            "created_at": 1_781_000_000,
+                            "body": "handoff:\nPR: https://github.com/dannyfranca/agent-alert-monitor/pull/7\nTests pass",
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open Kanban task](http://agent:9119/kanban?task=t_review)\n[Open GitHub PR](https://github.com/dannyfranca/agent-alert-monitor/pull/7)" in message
+
+
+def test_github_pr_shorthand_from_handoff_comment_is_normalized(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_safe", "title": "Safe PR ref"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_safe", "title": "Safe PR ref"},
+                    "comments": [
+                        {
+                            "author": "coder",
+                            "created_at": 1_781_000_001,
+                            "body": "review-required handoff: github:dannyfranca/agent-kanban-monitor/pull/12",
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/dannyfranca/agent-kanban-monitor/pull/12)" in message
+    assert "github:dannyfranca/agent-kanban-monitor/pull/12" not in message
+
+
+def test_no_pr_reference_leaves_output_without_pr_link(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_none", "title": "No PR", "result": "needs product decision"}])
+        if "show" in args:
+            return completed_json(args, {"task": {"id": "t_none", "title": "No PR", "result": "needs product decision"}, "comments": []})
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open Kanban task](http://agent:9119/kanban?task=t_none)" in message
+    assert "Open GitHub PR" not in message
+
+
+def test_pr_links_can_be_disabled_in_config(tmp_path):
+    config_path = write_config(tmp_path, include_pr_link=False)
+    calls = []
+
+    def runner(args, env=None):
+        calls.append(args)
+        if "list" in args:
+            return completed_json(
+                args,
+                [
+                    {
+                        "id": "t_disabled",
+                        "title": "Disabled PR link",
+                        "result": "review-required: github:dannyfranca/agent-kanban-monitor/pull/13",
+                    }
+                ],
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "Open GitHub PR" not in message
+    assert len(calls) == 1
+
+
+def test_multiple_newly_blocked_cards_render_pr_links_independently(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(
+                args,
+                [
+                    {"id": "t_with_pr", "title": "Card with PR"},
+                    {"id": "t_without_pr", "title": "Card without PR"},
+                ],
+            )
+        if "show" in args and "t_with_pr" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_with_pr", "title": "Card with PR"},
+                    "comments": [{"created_at": 2, "body": "github:owner/repo/pull/99"}],
+                },
+            )
+        if "show" in args and "t_without_pr" in args:
+            return completed_json(args, {"task": {"id": "t_without_pr", "title": "Card without PR"}, "comments": []})
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    blocks = [block for block in message.split("\n\n") if "⏸ `" in block]
+    with_pr_block, without_pr_block = blocks
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/99)" in with_pr_block
+    assert "Open GitHub PR" not in without_pr_block
+
+
+def test_detail_handoff_pr_takes_precedence_over_stale_list_pr(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(
+                args,
+                [
+                    {
+                        "id": "t_stale_pr",
+                        "title": "Stale PR",
+                        "result": "old handoff https://github.com/owner/repo/pull/1",
+                    }
+                ],
+            )
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_stale_pr", "title": "Stale PR"},
+                    "comments": [{"created_at": 2, "body": "current handoff github:owner/repo/pull/2"}],
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/2)" in message
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/1)" not in message
+
+
+def test_newest_detail_context_wins_across_string_timestamp_comments_and_runs(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_newest", "title": "Newest context"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_newest", "title": "Newest context"},
+                    "comments": [{"created_at": "2026-06-16T10:00:00Z", "body": "older github:owner/repo/pull/10"}],
+                    "runs": [
+                        {
+                            "id": 12,
+                            "created_at": "2026-06-16T09:00:00Z",
+                            "ended_at": "2026-06-16T11:00:00Z",
+                            "metadata": {"handoff": {"pr_url": "https://github.com/owner/repo/pull/11"}},
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/11)" in message
+    assert "pull/10" not in message
+
+
+def test_latest_summary_pr_takes_precedence_over_older_detail_context(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_latest_summary", "title": "Latest summary"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_latest_summary", "title": "Latest summary"},
+                    "comments": [{"created_at": "2026-06-16T10:00:00Z", "body": "older github:owner/repo/pull/20"}],
+                    "runs": [{"ended_at": "2026-06-16T11:00:00Z", "summary": "current review handoff github:owner/repo/pull/21"}],
+                    "latest_summary": "current review handoff github:owner/repo/pull/21",
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/21)" in message
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/20)" not in message
+
+
+def test_latest_summary_does_not_replace_existing_block_reason(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_reason_priority", "title": "Reason priority", "result": "needs product decision"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_reason_priority", "title": "Reason priority", "result": "needs product decision"},
+                    "runs": [{"ended_at": "2026-06-16T11:00:00Z", "summary": "worker summary github:owner/repo/pull/32"}],
+                    "latest_summary": "worker summary github:owner/repo/pull/32",
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "↳ needs product decision" in message
+    assert "↳ worker summary" not in message
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/32)" in message
+
+
+def test_newer_context_wins_over_unmatched_latest_summary(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_corrected", "title": "Corrected PR"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_corrected", "title": "Corrected PR"},
+                    "runs": [{"ended_at": "2026-06-16T09:00:00Z", "summary": "old github:owner/repo/pull/40"}],
+                    "comments": [{"created_at": "2026-06-16T12:00:00", "body": "corrected github:owner/repo/pull/41"}],
+                    "latest_summary": "old github:owner/repo/pull/40",
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/41)" in message
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/40)" not in message
+
+
+def test_http_github_pr_url_is_normalized_to_https(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_http", "title": "HTTP PR"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {"task": {"id": "t_http", "title": "HTTP PR"}, "comments": [{"created_at": 1, "body": "http://github.com/owner/repo/pull/22"}]},
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/22)" in message
+    assert "http://github.com/owner/repo/pull/22" not in message
+
+
+def test_run_pr_scan_ignores_unrelated_prompt_fields(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_run_fields", "title": "Run fields"}])
+        if "show" in args:
+            return completed_json(
+                args,
+                {
+                    "task": {"id": "t_run_fields", "title": "Run fields"},
+                    "runs": [
+                        {
+                            "ended_at": "2026-06-16T11:00:00Z",
+                            "prompt": "old unrelated https://github.com/owner/repo/pull/30",
+                            "metadata": {
+                                "old_pr": "https://github.com/owner/repo/pull/30",
+                                "handoff": {"pr_url": "https://github.com/owner/repo/pull/31"},
+                            },
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/31)" in message
+    assert "[Open GitHub PR](https://github.com/owner/repo/pull/30)" not in message
+
+
+def test_show_failure_falls_back_to_core_blocked_notification(tmp_path):
+    config_path = write_config(tmp_path)
+
+    def runner(args, env=None):
+        if "list" in args:
+            return completed_json(args, [{"id": "t_show_fail", "title": "Show fails", "result": "needs human input"}])
+        if "show" in args:
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="card changed")
+        raise AssertionError(args)
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert "⏸ `t_show_fail` — Show fails" in message
+    assert "↳ needs human input" in message
+    assert "`t_show_fail`" in message
+    assert "Open GitHub PR" not in message
+    assert read_state(config_path)["notified"]["default:t_show_fail"]["notified_at"] == 10
 
 
 def test_unchanged_blocked_task_emits_nothing_on_subsequent_run(tmp_path):
@@ -379,7 +749,7 @@ def test_dashboard_url_template_substitution_and_title_truncation(tmp_path):
     )
 
     assert "A title tha…" in message
-    assert "https://example.test/ops/tasks/t_link" in message
+    assert "[Open Kanban task](https://example.test/ops/tasks/t_link)" in message
 
 
 def test_malformed_dashboard_template_exits_nonzero_without_updating_state(tmp_path):

@@ -68,6 +68,8 @@ Example:
   "dashboard_url_template": "http://YOUR-HERMES-HOST:9119/kanban?task={task_id}",
   "title_max_chars": 120,
   "include_reason": true,
+  "include_pr_link": true,
+  "pr_link_label": "Open GitHub PR",
   "max_state_age_days": 30
 }
 ```
@@ -76,6 +78,8 @@ Notes:
 - `dashboard_url_template` must include `{task_id}`. It may also include `{board}`.
 - For phone/mobile use, set a reachable URL, e.g. Tailnet: `http://agent:9119/kanban?task={task_id}`.
 - If multiple Hermes profiles monitor boards with the same name, give each profile its own `state_path` to keep notification history isolated.
+- `include_pr_link` defaults to `true`. When enabled, newly blocked tasks are enriched with `hermes kanban show <task_id> --json` and the watchdog scans task details, comments, and run metadata for GitHub PR references.
+- PR references may be raw URLs such as `https://github.com/owner/repo/pull/123` or Kanban-safe shorthands such as `github:owner/repo/pull/123`; both render as a markdown link using `pr_link_label`.
 - Do not put polling frequency in this config. Frequency belongs to the scheduler: Hermes cron `every 5m` / `every 10m`, or systemd `OnUnitActiveSec=5min`.
 
 ## Run once
@@ -90,7 +94,21 @@ Output when a task is newly blocked:
 🚧 **Kanban needs attention**
 
 ⏸ `t_aa4b9231` — Implement WhatsApp cart total in holder-name prompt
-🔗 http://agent:9119/kanban?task=t_aa4b9231
+↳ needs product decision
+[Open Kanban task](http://agent:9119/kanban?task=t_aa4b9231)
+
+Tip: unblock or comment from the Kanban dashboard when ready.
+```
+
+If the card handoff includes a GitHub PR reference, the PR link is rendered immediately below the Kanban task link:
+
+```markdown
+🚧 **Kanban needs attention**
+
+⏸ `t_aa4b9231` — Implement WhatsApp cart total in holder-name prompt
+↳ review-required: PR opened
+[Open Kanban task](http://agent:9119/kanban?task=t_aa4b9231)
+[Open GitHub PR](https://github.com/owner/repo/pull/123)
 
 Tip: unblock or comment from the Kanban dashboard when ready.
 ```
@@ -143,6 +161,12 @@ cronjob(
 ```
 
 Use any frequency you want (`every 5m`, `every 10m`, `0 9 * * *`, etc.). The script stays idempotent regardless of frequency.
+
+For clean Telegram output without Hermes' generic cron header/footer, set:
+
+```bash
+hermes config set cron.wrap_response false
+```
 
 ## Alternative: systemd user timer
 
