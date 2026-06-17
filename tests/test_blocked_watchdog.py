@@ -62,10 +62,11 @@ def test_first_blocked_task_emits_message_and_records_state(tmp_path):
 
     message = run_once(config_path, runner=runner, now=1_781_332_000)
 
-    assert "🚧 **Kanban needs attention**" in message
-    assert "⏸ `t_aa4b9231` — Implement WhatsApp cart total in holder-name prompt" in message
-    assert "↳ needs product decision" in message
+    assert "🟢 **Kanban ready — needs product decision**" in message
+    assert "`t_aa4b9231`" in message
     assert "[Open Kanban task](http://agent:9119/kanban?task=t_aa4b9231)" in message
+    assert "🚧 **Kanban needs attention**" not in message
+    assert "Tip: unblock or comment" not in message
     assert runner.last_args == ["hermes", "kanban", "--board", "default", "show", "t_aa4b9231", "--json"]
     assert runner.last_env["HERMES_KANBAN_BOARD"] == "default"
     assert read_state(config_path) == {
@@ -110,7 +111,7 @@ def test_new_blocked_task_uses_latest_summary_from_show_when_list_has_no_reason(
 
     message = run_once(config_path, runner=runner, now=10)
 
-    assert "↳ permission-required: grant workflow scope" in message
+    assert "🟢 **Kanban ready — permission-required: grant workflow scope**" in message
     assert calls[0] == ["hermes", "kanban", "--board", "default", "list", "--status", "blocked", "--json"]
     assert calls[1] == ["hermes", "kanban", "--board", "default", "show", "t_reason", "--json"]
 
@@ -237,7 +238,7 @@ def test_multiple_newly_blocked_cards_render_pr_links_independently(tmp_path):
 
     message = run_once(config_path, runner=runner, now=10)
 
-    blocks = [block for block in message.split("\n\n") if "⏸ `" in block]
+    blocks = [block for block in message.split("\n\n") if "🟢 **Kanban ready" in block]
     with_pr_block, without_pr_block = blocks
     assert "[Open GitHub PR](https://github.com/owner/repo/pull/99)" in with_pr_block
     assert "Open GitHub PR" not in without_pr_block
@@ -347,8 +348,8 @@ def test_latest_summary_does_not_replace_existing_block_reason(tmp_path):
 
     message = run_once(config_path, runner=runner, now=10)
 
-    assert "↳ needs product decision" in message
-    assert "↳ worker summary" not in message
+    assert "🟢 **Kanban ready — needs product decision**" in message
+    assert "🟢 **Kanban ready — worker summary" not in message
     assert "[Open GitHub PR](https://github.com/owner/repo/pull/32)" in message
 
 
@@ -438,8 +439,8 @@ def test_show_failure_falls_back_to_core_blocked_notification(tmp_path):
 
     message = run_once(config_path, runner=runner, now=10)
 
-    assert "⏸ `t_show_fail` — Show fails" in message
-    assert "↳ needs human input" in message
+    assert "🟢 **Kanban ready — needs human input**" in message
+    assert "`t_show_fail`" in message
     assert "`t_show_fail`" in message
     assert "Open GitHub PR" not in message
     assert read_state(config_path)["notified"]["default:t_show_fail"]["notified_at"] == 10
@@ -492,8 +493,8 @@ def test_main_emits_new_blocked_task_markdown_on_stdout(tmp_path):
     )
 
     assert exit_code == 0
-    assert "🚧 **Kanban needs attention**" in stdout.getvalue()
-    assert "⏸ `t_cli` — CLI notification" in stdout.getvalue()
+    assert "🟢 **Kanban ready — CLI notification**" in stdout.getvalue()
+    assert "`t_cli`" in stdout.getvalue()
     assert stderr.getvalue() == ""
 
 
@@ -532,11 +533,11 @@ def test_multiple_blocked_tasks_are_grouped_in_one_message(tmp_path):
         now=10,
     )
 
-    assert message.startswith("🚧 **Kanban needs attention**")
-    assert message.count("⏸ `") == 2
+    assert message.startswith("🟢 **Kanban ready — First blocked task**")
+    assert message.count("🟢 **Kanban ready") == 2
     assert "t_one" in message
     assert "t_two" in message
-    assert "Tip: unblock or comment from the Kanban dashboard when ready." in message
+    assert "Tip: unblock or comment from the Kanban dashboard when ready." not in message
 
 
 def test_mixed_old_and_new_blocked_tasks_emit_only_new_task(tmp_path):
