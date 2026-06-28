@@ -934,3 +934,199 @@ def test_failed_kanban_command_exits_nonzero_without_updating_state(tmp_path):
     assert stdout.getvalue() == ""
     assert "hermes kanban list failed" in stderr.getvalue()
     assert json.loads(state_path.read_text(encoding="utf-8")) == original
+
+
+class MultiBoardRunner:
+    def __init__(self, boards=None, tasks_by_board=None, details_by_board_task=None, fail_boards=None):
+        self.boards = boards or []
+        self.tasks_by_board = tasks_by_board or {}
+        self.details_by_board_task = details_by_board_task or {}
+        self.fail_boards = fail_boards or {}
+        self.calls = []
+
+    def __call__(self, args, env=None):
+        self.calls.append((args, env or {}))
+        if args == ["hermes", "kanban", "boards", "list", "--json"]:
+            return completed_json(args, self.boards)
+        if "list" in args:
+            board = args[args.index("--board") + 1]
+            if board in self.fail_boards:
+                return subprocess.CompletedProcess(args=args, returncode=2, stdout="", stderr=self.fail_boards[board])
+            return completed_json(args, self.tasks_by_board.get(board, []))
+        if "show" in args:
+            board = args[args.index("--board") + 1]
+            task_id = args[args.index("show") + 1]
+            return completed_json(args, self.details_by_board_task.get((board, task_id), {"task": {"id": task_id}}))
+        raise AssertionError(args)
+
+
+def test_boards_all_discovers_non_archived_boards_and_notifies_per_board(tmp_path):
+    config_path = write_config(
+        tmp_path,
+        boards="all",
+        dashboard_url_template="http://agent:9119/kanban?board={board}&task={task_id}",
+    )
+    runner = MultiBoardRunner(
+        boards=[
+            {"slug": "default", "archived": False},
+            {"slug": "psp", "archived": False},
+            {"slug": "old", "archived": True},
+        ],
+        tasks_by_board={
+            "default": [{"id": "t_same", "title": "Default blocked", "result": "default reason"}],
+            "psp": [{"id": "t_same", "title": "PSP blocked", "result": "psp reason"}],
+            "old": [{"id": "t_archived", "title": "Should not poll"}],
+        },
+    )
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert message.count("🟢 **Kanban ready") == 2
+    assert "Board: `default`" in message
+    assert "Board: `psp`" in message
+    assert "board=default&task=t_same" in message
+    assert "board=psp&task=t_same" in message
+    assert "old" not in [call[0][call[0].index("--board") + 1] for call in runner.calls if "--board" in call[0]]
+    assert set(read_state(config_path)["notified"]) == {"default:t_same", "psp:t_same"}
+
+
+def test_explicit_boards_array_polls_each_board_with_filters_without_discovery(tmp_path):
+    config_path = write_config(tmp_path, boards=["default", "psp"], status="review", assignee="coder", tenant="customer-a")
+    runner = MultiBoardRunner(tasks_by_board={"default": [], "psp": []})
+
+    run_once(config_path, runner=runner, now=10)
+
+    assert [call[0] for call in runner.calls] == [
+        [
+            "hermes",
+            "kanban",
+            "--board",
+            "default",
+            "list",
+            "--status",
+            "review",
+            "--json",
+            "--assignee",
+            "coder",
+            "--tenant",
+            "customer-a",
+        ],
+        [
+            "hermes",
+            "kanban",
+            "--board",
+            "psp",
+            "list",
+            "--status",
+            "review",
+            "--json",
+            "--assignee",
+            "coder",
+            "--tenant",
+            "customer-a",
+        ],
+    ]
+    assert all(call[1]["HERMES_KANBAN_BOARD"] in {"default", "psp"} for call in runner.calls)
+
+
+def test_multi_board_state_cleanup_is_scoped_to_each_polled_board(tmp_path):
+    config_path = write_config(tmp_path, boards=["default", "psp"])
+    state_path = Path(json.loads(config_path.read_text(encoding="utf-8"))["state_path"])
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "notified": {
+                    "default:t_old": {"task_id": "t_old", "board": "default", "notified_at": 1, "last_seen_blocked_at": 1},
+                    "psp:t_keep": {"task_id": "t_keep", "board": "psp", "notified_at": 1, "last_seen_blocked_at": 1},
+                    "ops:t_other": {"task_id": "t_other", "board": "ops", "notified_at": 1, "last_seen_blocked_at": 1},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = MultiBoardRunner(tasks_by_board={"default": [], "psp": [{"id": "t_keep", "title": "Still blocked"}]})
+
+    run_once(config_path, runner=runner, now=10)
+
+    state = read_state(config_path)["notified"]
+    assert set(state) == {"psp:t_keep", "ops:t_other"}
+    assert state["psp:t_keep"]["last_seen_blocked_at"] == 10
+
+
+@pytest.mark.parametrize("boards", ["default", [], ["default", ""], ["default", 3], {"slug": "default"}, None])
+def test_invalid_boards_config_exits_nonzero_without_running_kanban(tmp_path, boards):
+    config_path = write_config(tmp_path, boards=boards)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    called = False
+
+    def runner(args, env=None):
+        nonlocal called
+        called = True
+        raise AssertionError("runner should not be called")
+
+    exit_code = main(["--config", str(config_path)], runner=runner, stdout=stdout, stderr=stderr, now=10)
+
+    assert exit_code == 1
+    assert called is False
+    assert stdout.getvalue() == ""
+    assert "boards" in stderr.getvalue()
+
+
+def test_boards_all_discovery_failure_exits_nonzero_without_updating_state(tmp_path):
+    config_path = write_config(tmp_path, boards="all")
+    state_path = Path(json.loads(config_path.read_text(encoding="utf-8"))["state_path"])
+    original = {"version": 1, "notified": {"default:t_keep": {"task_id": "t_keep", "board": "default", "notified_at": 1, "last_seen_blocked_at": 1}}}
+    state_path.write_text(json.dumps(original), encoding="utf-8")
+
+    def runner(args, env=None):
+        return subprocess.CompletedProcess(args=args, returncode=2, stdout="", stderr="boards unavailable")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = main(["--config", str(config_path)], runner=runner, stdout=stdout, stderr=stderr, now=10)
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert "hermes kanban boards list failed" in stderr.getvalue()
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original
+
+
+def test_multi_board_list_failure_exits_nonzero_without_updating_state(tmp_path):
+    config_path = write_config(tmp_path, boards=["default", "psp"])
+    state_path = Path(json.loads(config_path.read_text(encoding="utf-8"))["state_path"])
+    original = {"version": 1, "notified": {}}
+    state_path.write_text(json.dumps(original), encoding="utf-8")
+    runner = MultiBoardRunner(tasks_by_board={"default": []}, fail_boards={"psp": "board unavailable"})
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    exit_code = main(["--config", str(config_path)], runner=runner, stdout=stdout, stderr=stderr, now=10)
+
+    assert exit_code == 1
+    assert stdout.getvalue() == ""
+    assert "hermes kanban list failed for board 'psp'" in stderr.getvalue()
+    assert json.loads(state_path.read_text(encoding="utf-8")) == original
+
+
+
+def test_boards_all_empty_discovery_preserves_existing_state_without_polling_default(tmp_path):
+    config_path = write_config(tmp_path, boards="all")
+    state_path = Path(json.loads(config_path.read_text(encoding="utf-8"))["state_path"])
+    original = {
+        "version": 1,
+        "notified": {
+            "default:t_keep": {"task_id": "t_keep", "board": "default", "notified_at": 1, "last_seen_blocked_at": 1},
+            "psp:t_keep": {"task_id": "t_keep", "board": "psp", "notified_at": 1, "last_seen_blocked_at": 1},
+        },
+    }
+    state_path.write_text(json.dumps(original), encoding="utf-8")
+    runner = MultiBoardRunner(boards=[])
+
+    message = run_once(config_path, runner=runner, now=10)
+
+    assert message == ""
+    assert [call[0] for call in runner.calls] == [["hermes", "kanban", "boards", "list", "--json"]]
+    assert runner.calls[0][1] == {"HERMES_KANBAN_DB": ""}
+    assert read_state(config_path) == original

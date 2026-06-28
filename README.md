@@ -9,7 +9,7 @@ No new blocked tasks means empty stdout. This is intentional so the tool works c
 ## Features
 
 - Generic: no hardcoded board names, chat IDs, Danny-specific paths, or dashboard hosts.
-- Configurable board/status/assignee/tenant filters.
+- Configurable board/status/assignee/tenant filters, including dynamic multi-board polling.
 - Configurable state path and dashboard URL template.
 - Idempotent notifications while a task remains blocked.
 - Self-cleaning state when tasks leave blocked status, with TTL pruning as a safety net.
@@ -60,12 +60,12 @@ Example:
 ```json
 {
   "enabled": true,
-  "board": "default",
+  "boards": "all",
   "status": "blocked",
   "assignee": null,
   "tenant": null,
   "state_path": "~/.hermes/kanban-blocked-watchdog/state.json",
-  "dashboard_url_template": "http://YOUR-HERMES-HOST:9119/kanban?task={task_id}",
+  "dashboard_url_template": "http://YOUR-HERMES-HOST:9119/kanban?board={board}&task={task_id}",
   "title_max_chars": 120,
   "include_reason": true,
   "include_pr_link": true,
@@ -74,9 +74,24 @@ Example:
 }
 ```
 
+Board selection examples:
+
+```json
+{ "board": "default" }
+```
+
+```json
+{ "boards": "all" }
+```
+
+```json
+{ "boards": ["default", "psp"] }
+```
+
 Notes:
-- `dashboard_url_template` must include `{task_id}`. It may also include `{board}`.
-- For phone/mobile use, set a reachable URL, e.g. Tailnet: `http://agent:9119/kanban?task={task_id}`.
+- Legacy single-board config still works with `"board": "default"` and no `boards` field.
+- New multi-board config uses `boards`: set `"all"` to discover every non-archived Kanban board at runtime, or an explicit allowlist such as `["default", "psp"]`. Invalid `boards` shapes make the watchdog exit non-zero so cron alerts visibly.
+- `dashboard_url_template` must include `{task_id}`. It may also include `{board}`; use `{board}` for multi-board links, e.g. Tailnet: `http://agent:9119/kanban?board={board}&task={task_id}`.
 - If multiple Hermes profiles monitor boards with the same name, give each profile its own `state_path` to keep notification history isolated.
 - `include_pr_link` defaults to `true`. When enabled, newly blocked tasks are enriched with `hermes kanban show <task_id> --json` and the watchdog scans task details, comments, and run metadata for GitHub PR references.
 - PR references may be raw URLs such as `https://github.com/owner/repo/pull/123` or Kanban-safe shorthands such as `github:owner/repo/pull/123`; both render as a markdown link using `pr_link_label`.
@@ -88,29 +103,23 @@ Notes:
 kanban-blocked-watchdog --config ~/.config/agent-kanban-monitor/blocked-watchdog.json
 ```
 
-Output when a task is newly blocked:
+Output when a task is newly blocked with multi-board config (`boards` present). Legacy single-board config omits the `Board:` line:
 
 ```markdown
-🚧 **Kanban needs attention**
-
-⏸ `t_aa4b9231` — Implement WhatsApp cart total in holder-name prompt
-↳ needs product decision
-[Open Kanban task](http://agent:9119/kanban?task=t_aa4b9231)
-
-Tip: unblock or comment from the Kanban dashboard when ready.
+🟢 **Kanban ready — needs product decision**
+`t_aa4b9231`
+Board: `default`
+[Open Kanban task](http://agent:9119/kanban?board=default&task=t_aa4b9231)
 ```
 
 If the card handoff includes a GitHub PR reference, the PR link is rendered immediately below the Kanban task link:
 
 ```markdown
-🚧 **Kanban needs attention**
-
-⏸ `t_aa4b9231` — Implement WhatsApp cart total in holder-name prompt
-↳ review-required: PR opened
-[Open Kanban task](http://agent:9119/kanban?task=t_aa4b9231)
+🟢 **Kanban ready — review-required: PR opened**
+`t_aa4b9231`
+Board: `default`
+[Open Kanban task](http://agent:9119/kanban?board=default&task=t_aa4b9231)
 [Open GitHub PR](https://github.com/owner/repo/pull/123)
-
-Tip: unblock or comment from the Kanban dashboard when ready.
 ```
 
 Multiple newly blocked tasks are grouped in one message.
@@ -202,5 +211,6 @@ The test suite covers:
 - re-notification after a task leaves and becomes blocked again;
 - grouped messages;
 - TTL pruning;
-- dashboard URL substitution;
+- dashboard URL substitution, including `{board}`;
+- legacy `board`, `boards: "all"`, explicit board arrays, archived-board exclusion, per-board dedupe, and board-scoped cleanup;
 - malformed config / invalid Kanban JSON / failed Kanban command safety.
