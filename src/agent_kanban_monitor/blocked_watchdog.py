@@ -43,6 +43,7 @@ class StateError(WatchdogError):
 class WatchdogConfig:
     enabled: bool = True
     board: str | None = "default"
+    boards: str | tuple[str, ...] | None = None
     status: str = "blocked"
     assignee: str | None = None
     tenant: str | None = None
@@ -115,13 +116,21 @@ class WatchdogConfig:
         if not isinstance(status, str) or not status.strip():
             raise ConfigError("config field 'status' must be a non-empty string")
 
+        boards = parse_boards_config(data.get("boards")) if "boards" in data else None
         board = data.get("board", cls.board)
-        if not isinstance(board, str) or not board.strip():
-            raise ConfigError("config field 'board' must be a non-empty string")
+        if boards is None:
+            if not isinstance(board, str) or not board.strip():
+                raise ConfigError("config field 'board' must be a non-empty string")
+            board = board.strip()
+        elif board is not None:
+            if not isinstance(board, str) or not board.strip():
+                raise ConfigError("config field 'board' must be a non-empty string when present")
+            board = board.strip()
 
         return cls(
             enabled=enabled,
             board=board,
+            boards=boards,
             status=status,
             assignee=optional_str("assignee"),
             tenant=optional_str("tenant"),
@@ -140,14 +149,37 @@ class WatchdogConfig:
 
     @property
     def state_scope_key(self) -> str:
-        parts = [self.board_key]
-        if self.status != "blocked":
-            parts.append(f"status={self.status}")
-        if self.assignee:
-            parts.append(f"assignee={self.assignee}")
-        if self.tenant:
-            parts.append(f"tenant={self.tenant}")
-        return "|".join(parts)
+        return state_scope_key_for_board(self, self.board_key)
+
+    @property
+    def is_multi_board_mode(self) -> bool:
+        return self.boards is not None
+
+
+def parse_boards_config(value: Any) -> str | tuple[str, ...]:
+    if value == "all":
+        return "all"
+    if isinstance(value, list):
+        if not value:
+            raise ConfigError("config field 'boards' array must contain at least one board slug")
+        boards: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                raise ConfigError(f"config field 'boards' item {index} must be a non-empty string")
+            boards.append(item.strip())
+        return tuple(boards)
+    raise ConfigError("config field 'boards' must be either the string 'all' or an array of non-empty strings")
+
+
+def state_scope_key_for_board(config: WatchdogConfig, board: str) -> str:
+    parts = [board]
+    if config.status != "blocked":
+        parts.append(f"status={config.status}")
+    if config.assignee:
+        parts.append(f"assignee={config.assignee}")
+    if config.tenant:
+        parts.append(f"tenant={config.tenant}")
+    return "|".join(parts)
 
 
 def default_runner(args: list[str], env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -164,9 +196,10 @@ def run_once(config_path: str | Path, *, runner: Runner | None = None, now: int 
 
     current_time = int(time.time() if now is None else now)
     command_runner = runner or default_runner
-    tasks = fetch_blocked_tasks(config, runner=command_runner)
+    boards = resolve_boards(config, runner=command_runner)
+    tasks = fetch_blocked_tasks(config, runner=command_runner, boards=boards)
     state = load_state(config.state_path)
-    new_state, newly_blocked = update_state(config, state, tasks, now=current_time)
+    new_state, newly_blocked = update_state(config, state, tasks, current_boards=boards, now=current_time)
 
     if not newly_blocked:
         save_state_atomic(config.state_path, new_state)
@@ -177,33 +210,104 @@ def run_once(config_path: str | Path, *, runner: Runner | None = None, now: int 
     return message
 
 
-def fetch_blocked_tasks(config: WatchdogConfig, *, runner: Runner) -> list[dict[str, Any]]:
-    args = ["hermes", "kanban", "--board", config.board_key, "list", "--status", config.status, "--json"]
-    command_env: dict[str, str] = {}
-    if config.board:
-        command_env["HERMES_KANBAN_BOARD"] = config.board
-        command_env["HERMES_KANBAN_DB"] = ""
+def fetch_blocked_tasks(config: WatchdogConfig, *, runner: Runner, boards: Sequence[str] | None = None) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    selected_boards = list(boards) if boards is not None else resolve_boards(config, runner=runner)
+    for board in selected_boards:
+        tasks.extend(fetch_blocked_tasks_for_board(config, board, runner=runner))
+    return tasks
+
+
+def resolve_boards(config: WatchdogConfig, *, runner: Runner) -> list[str]:
+    if config.boards is None:
+        return [config.board_key]
+    if config.boards == "all":
+        return discover_boards(runner=runner)
+    return list(config.boards)
+
+
+def discover_boards(*, runner: Runner) -> list[str]:
+    args = ["hermes", "kanban", "boards", "list", "--json"]
+    try:
+        completed = runner(args, command_env_for_discovery())
+    except OSError as exc:
+        raise KanbanCommandError(f"failed to run hermes kanban boards list: {exc}") from exc
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        raise KanbanCommandError(f"hermes kanban boards list failed with exit code {completed.returncode}{detail}")
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise KanbanCommandError(f"invalid Kanban boards JSON: {exc}") from exc
+
+    boards = extract_boards(payload)
+    return [board["slug"] for board in boards if not board.get("archived", False)]
+
+
+def extract_boards(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        candidates = payload
+    elif isinstance(payload, dict):
+        candidates = _first_list_value(payload, ("boards", "items", "data", "results"))
+        if candidates is None and isinstance(payload.get("data"), dict):
+            candidates = _first_list_value(payload["data"], ("boards", "items", "results"))
+    else:
+        candidates = None
+
+    if not isinstance(candidates, list):
+        raise KanbanCommandError("invalid Kanban boards JSON: expected a list of boards")
+
+    boards: list[dict[str, Any]] = []
+    for index, board in enumerate(candidates):
+        if not isinstance(board, dict):
+            raise KanbanCommandError(f"invalid Kanban boards JSON: board at index {index} is not an object")
+        slug = board.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            raise KanbanCommandError(f"invalid Kanban boards JSON: board at index {index} is missing string slug")
+        board = dict(board)
+        board["slug"] = slug.strip()
+        boards.append(board)
+    return boards
+
+
+def fetch_blocked_tasks_for_board(config: WatchdogConfig, board: str, *, runner: Runner) -> list[dict[str, Any]]:
+    args = ["hermes", "kanban", "--board", board, "list", "--status", config.status, "--json"]
+    command_env = command_env_for_board(board)
     if config.assignee:
         args.extend(["--assignee", config.assignee])
     if config.tenant:
         args.extend(["--tenant", config.tenant])
 
     try:
-        completed = runner(args, command_env or None)
+        completed = runner(args, command_env)
     except OSError as exc:
-        raise KanbanCommandError(f"failed to run hermes kanban list: {exc}") from exc
+        raise KanbanCommandError(f"failed to run hermes kanban list for board {board!r}: {exc}") from exc
 
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         detail = f": {stderr}" if stderr else ""
-        raise KanbanCommandError(f"hermes kanban list failed with exit code {completed.returncode}{detail}")
+        raise KanbanCommandError(f"hermes kanban list failed for board {board!r} with exit code {completed.returncode}{detail}")
 
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        raise KanbanCommandError(f"invalid Kanban JSON: {exc}") from exc
+        raise KanbanCommandError(f"invalid Kanban JSON for board {board!r}: {exc}") from exc
 
-    return extract_tasks(payload)
+    tasks = extract_tasks(payload)
+    for task in tasks:
+        task["_kanban_board"] = board
+    return tasks
+
+
+def command_env_for_board(board: str) -> dict[str, str]:
+    return {"HERMES_KANBAN_BOARD": board, "HERMES_KANBAN_DB": ""}
+
+
+def command_env_for_discovery() -> dict[str, str]:
+    return {"HERMES_KANBAN_DB": ""}
 
 
 def enrich_newly_blocked_tasks(
@@ -219,7 +323,7 @@ def enrich_newly_blocked_tasks(
         if not task_needs_detail_enrichment(config, task):
             enriched.append(task)
         else:
-            enriched.append(fetch_task_detail(config, str(task["id"]), runner=runner, fallback=task))
+            enriched.append(fetch_task_detail(config, str(task["id"]), board=task_board(config, task), runner=runner, fallback=task))
     return enriched
 
 
@@ -233,17 +337,15 @@ def fetch_task_detail(
     config: WatchdogConfig,
     task_id: str,
     *,
+    board: str,
     runner: Runner,
     fallback: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    args = ["hermes", "kanban", "--board", config.board_key, "show", task_id, "--json"]
-    command_env: dict[str, str] = {}
-    if config.board:
-        command_env["HERMES_KANBAN_BOARD"] = config.board
-        command_env["HERMES_KANBAN_DB"] = ""
+    args = ["hermes", "kanban", "--board", board, "show", task_id, "--json"]
+    command_env = command_env_for_board(board)
 
     try:
-        completed = runner(args, command_env or None)
+        completed = runner(args, command_env)
     except OSError:
         return fallback
 
@@ -267,6 +369,7 @@ def fetch_task_detail(
         if isinstance(value, str) and value.strip():
             enriched[key] = value.strip()
     enriched["_kanban_detail"] = payload
+    enriched["_kanban_board"] = board
     return enriched
 
 
@@ -321,10 +424,20 @@ def update_state(
     state: dict[str, Any],
     current_tasks: Sequence[Mapping[str, Any]],
     *,
+    current_boards: Sequence[str] | None = None,
     now: int,
 ) -> tuple[dict[str, Any], list[Mapping[str, Any]]]:
-    current_scope = config.state_scope_key
-    current_by_key = {state_key(current_scope, str(task["id"])): task for task in current_tasks}
+    current_by_key: dict[str, Mapping[str, Any]] = {}
+    current_scopes: set[str] = set()
+    scoped_boards = [config.board_key] if current_boards is None else current_boards
+    for board in scoped_boards:
+        current_scopes.add(state_scope_key_for_board(config, board))
+    for task in current_tasks:
+        board = task_board(config, task)
+        scope = state_scope_key_for_board(config, board)
+        current_scopes.add(scope)
+        current_by_key[state_key(scope, str(task["id"]))] = task
+
     notified = state.get("notified", {})
     ttl_seconds = config.max_state_age_days * 24 * 60 * 60
 
@@ -334,25 +447,27 @@ def update_state(
     for key, existing in notified.items():
         if not isinstance(existing, dict):
             continue
-        if entry_scope(key, existing) != current_scope and not entry_is_stale(existing, now, ttl_seconds):
+        if entry_scope(key, existing) not in current_scopes and not entry_is_stale(existing, now, ttl_seconds):
             next_notified[key] = dict(existing)
 
     for key, task in current_by_key.items():
+        board = task_board(config, task)
+        current_scope = state_scope_key_for_board(config, board)
         existing = notified.get(key)
         if not isinstance(existing, dict):
             newly_blocked.append(task)
-            next_notified[key] = new_state_entry(config.board_key, current_scope, str(task["id"]), now, now)
+            next_notified[key] = new_state_entry(board, current_scope, str(task["id"]), now, now)
             continue
 
         if entry_is_stale(existing, now, ttl_seconds):
             newly_blocked.append(task)
-            next_notified[key] = new_state_entry(config.board_key, current_scope, str(task["id"]), now, now)
+            next_notified[key] = new_state_entry(board, current_scope, str(task["id"]), now, now)
             continue
 
         entry = dict(existing)
         entry["task_id"] = str(task["id"])
-        entry["board"] = config.board_key
-        if current_scope != config.board_key:
+        entry["board"] = board
+        if current_scope != board:
             entry["scope"] = current_scope
         else:
             entry.pop("scope", None)
@@ -360,6 +475,16 @@ def update_state(
         next_notified[key] = entry
 
     return {"version": 1, "notified": next_notified}, newly_blocked
+
+
+def task_board(config: WatchdogConfig, task: Mapping[str, Any]) -> str:
+    board = task.get("_kanban_board")
+    if isinstance(board, str) and board.strip():
+        return board.strip()
+    board = task.get("board")
+    if isinstance(board, str) and board.strip():
+        return board.strip()
+    return config.board_key
 
 
 def entry_board(key: str, entry: Mapping[str, Any]) -> str:
@@ -427,8 +552,11 @@ def render_message(config: WatchdogConfig, tasks: Sequence[Mapping[str, Any]]) -
         reason = extract_reason(task) if config.include_reason else None
         headline = truncate(reason or title, config.title_max_chars)
         lines.append(f"🟢 **Kanban ready — {headline}**")
+        board = task_board(config, task)
         lines.append(f"`{task_id}`")
-        lines.append(format_dashboard_link(config, task_id))
+        if config.is_multi_board_mode:
+            lines.append(f"Board: `{board}`")
+        lines.append(format_dashboard_link(config, task_id, board))
         pr_url = extract_pr_url(task) if config.include_pr_link else None
         if pr_url:
             lines.append(format_pr_link(config, pr_url))
@@ -595,15 +723,15 @@ def normalize_github_pr_url(owner: str, repo: str, number: str) -> str:
     return f"https://github.com/{owner}/{repo}/pull/{number}"
 
 
-def format_dashboard_url(config: WatchdogConfig, task_id: str) -> str:
+def format_dashboard_url(config: WatchdogConfig, task_id: str, board: str | None = None) -> str:
     try:
-        return config.dashboard_url_template.format(task_id=task_id, board=config.board_key)
+        return config.dashboard_url_template.format(task_id=task_id, board=board or config.board_key)
     except (KeyError, ValueError) as exc:
         raise ConfigError(f"invalid dashboard_url_template: {exc}") from exc
 
 
-def format_dashboard_link(config: WatchdogConfig, task_id: str) -> str:
-    target = format_dashboard_url(config, task_id)
+def format_dashboard_link(config: WatchdogConfig, task_id: str, board: str | None = None) -> str:
+    target = format_dashboard_url(config, task_id, board)
     if target.startswith("[") and "](" in target and target.endswith(")"):
         return target
     return f"[Open Kanban task]({target})"
